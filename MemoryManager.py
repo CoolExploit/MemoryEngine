@@ -2,13 +2,24 @@ import ctypes
 import psutil
 import struct
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
 from PIL import Image, ImageTk
-import time
 import threading
+import time
+import os
 
 PROCESS_ALL_ACCESS = 0x1F0FFF
-MEM_COMMIT = 0x1000  # Memory state for committed memory
+MEM_COMMIT = 0x1000
+PAGE_READWRITE = 0x04
+
+data_types = {
+    '4-byte Integer': 'i',
+    'Float': 'f',
+    'Double': 'd',
+    'Byte': 'b',
+    '2-byte Integer': 'h',
+    '8-byte Integer': 'q'
+}
 
 class MEMORY_BASIC_INFORMATION(ctypes.Structure):
     _fields_ = [
@@ -29,14 +40,11 @@ def read_memory(process_handle, address, size):
     bytes_read = ctypes.c_size_t(0)
     ctypes.windll.kernel32.ReadProcessMemory(process_handle, address, buffer, size, ctypes.byref(bytes_read))
     return buffer.raw
-  
-def write_memory(process_handle, address, value, size):
-    buffer = ctypes.create_string_buffer(size)
-    if isinstance(value, int):
-        struct.pack_into('I', buffer, 0, value)
-    elif isinstance(value, float):
-        struct.pack_into('f', buffer, 0, value)
-    ctypes.windll.kernel32.WriteProcessMemory(process_handle, address, buffer, size, None)
+
+def write_memory(process_handle, address, value, data_type):
+    buffer = ctypes.create_string_buffer(struct.calcsize(data_type))
+    struct.pack_into(data_type, buffer, 0, value)
+    ctypes.windll.kernel32.WriteProcessMemory(process_handle, address, buffer, len(buffer), None)
 
 def get_memory_regions(pid):
     process_handle = get_process_handle(pid)
@@ -45,152 +53,235 @@ def get_memory_regions(pid):
         addr = 0
         mbi = MEMORY_BASIC_INFORMATION()
         while ctypes.windll.kernel32.VirtualQueryEx(process_handle, ctypes.c_void_p(addr), ctypes.byref(mbi), ctypes.sizeof(mbi)):
-            if mbi.State == MEM_COMMIT:  # Check if the memory is committed
+            if mbi.State == MEM_COMMIT and mbi.Protect == PAGE_READWRITE:
                 regions.append((mbi.BaseAddress, mbi.RegionSize))
-            addr += mbi.RegionSize  # Move to the next region
+            addr += mbi.RegionSize
     finally:
         ctypes.windll.kernel32.CloseHandle(process_handle)
     return regions
-
-def get_process_icon(pid):
-    try:
-        process = psutil.Process(pid)
-        icon = process.icon()
-        return icon
-    except Exception:
-        return None
 
 class MemoryEngineApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Memory Engine")
-        self.root.geometry("1200x800")  # Set a larger window size
-        
-        self.main_frame = tk.Frame(root)
-        self.main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-
-        self.process_label = tk.Label(self.main_frame, text="Select Process:", font=("Arial", 16))
-        self.process_label.pack(pady=5)
-        
-        self.process_combobox = ttk.Combobox(self.main_frame, values=self.get_process_list(), font=("Arial", 14))
-        self.process_combobox.pack(pady=5, fill=tk.X)
-        self.process_combobox.bind("<<ComboboxSelected>>", self.update_process_icon)
-
-        self.icon_label = tk.Label(self.main_frame)
-        self.icon_label.pack(pady=5)
-      
-        self.memory_label = tk.Label(self.main_frame, text="Memory Regions:", font=("Arial", 16))
-        self.memory_label.pack(pady=5)
-
-        self.memory_canvas = tk.Canvas(self.main_frame)
-        self.memory_scrollbar = ttk.Scrollbar(self.main_frame, orient="vertical", command=self.memory_canvas.yview)
-        self.memory_frame = tk.Frame(self.memory_canvas)
-
-        self.memory_frame.bind("<Configure>", lambda e: self.memory_canvas.configure(scrollregion=self.memory_canvas.bbox("all")))
-
-        self.memory_canvas.create_window((0, 0), window=self.memory_frame, anchor="nw")
-        self.memory_canvas.configure(yscrollcommand=self.memory_scrollbar.set)
-
-        self.memory_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        self.memory_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-      
-        self.load_button = tk.Button(self.main_frame, text="Load Memory Regions", command=self.load_memory_regions, font=("Arial", 12))
-        self.load_button.pack(pady=10)
-
-        self.search_label = tk.Label(self.main_frame, text="Search Value:", font=("Arial", 14))
-        self.search_label.pack(pady=5)
-
-        self.search_entry = tk.Entry(self.main_frame, font=("Arial", 12))
-        self.search_entry.pack(pady=5, fill=tk.X)
-
-        self.search_button = tk.Button(self.main_frame, text="Search", command=self.search_memory, font=("Arial", 12))
-        self.search_button.pack(pady=10)
-
-        self.modify_label = tk.Label(self.main_frame, text="Modify Value:", font=("Arial", 14))
-        self.modify_label.pack(pady=5)
-
-        self.modify_entry = tk.Entry(self.main_frame, font=("Arial", 12))
-        self.modify_entry.pack(pady=5, fill=tk.X)
-
-        self.modify_button = tk.Button(self.main_frame, text="Modify", command=self.modify_memory, font=("Arial", 12))
-        self.modify_button.pack(pady=10)
-
-        self.freeze_button = tk.Button(self.main_frame, text="Freeze Value", command=self.freeze_value, font=("Arial", 12))
-        self.freeze_button.pack(pady=10)
-
-        self.version_button = tk.Button(self.main_frame, text="Get CE Version", command=self.get_ce_version, font=("Arial", 12))
-        self.version_button.pack(pady=10)
+        self.root.geometry("1800x1000")
+        self.root.configure(bg="#1e1e1e")
 
         self.frozen_values = {}
+        self.process_handle = None
+        self.selected_pid = None
+        self.scanned_results = []
+
+        self.setup_ui()
+
+    def setup_ui(self):
+        # Top Frame
+        top_frame = tk.Frame(self.root, bg="#1e1e1e")
+        top_frame.pack(fill=tk.X, padx=10, pady=10)
+
+        self.process_label = tk.Label(top_frame, text="Processes:", font=("Arial", 14), fg="white", bg="#1e1e1e")
+        self.process_label.pack(side=tk.LEFT, padx=5)
+
+        self.process_combobox = ttk.Combobox(top_frame, font=("Arial", 12), width=50)
+        self.process_combobox.pack(side=tk.LEFT, padx=5)
+        self.process_combobox['values'] = self.get_process_list()
+        self.process_combobox.bind("<<ComboboxSelected>>", self.process_selected)
+
+        self.refresh_button = tk.Button(top_frame, text="Refresh", command=self.refresh_process_list, bg="#2d2d2d", fg="white", font=("Arial", 12))
+        self.refresh_button.pack(side=tk.LEFT, padx=5)
+
+        self.attach_button = tk.Button(top_frame, text="Attach", command=self.attach_process, bg="#2d2d2d", fg="white", font=("Arial", 12))
+        self.attach_button.pack(side=tk.LEFT, padx=5)
+
+        self.main_frame = tk.Frame(self.root, bg="#2d2d2d", relief=tk.RIDGE, borderwidth=5)
+        self.main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        left_panel = tk.Frame(self.main_frame, bg="#2d2d2d")
+        left_panel.pack(side=tk.LEFT, fill=tk.Y, padx=10, pady=10)
+
+        self.memory_regions_label = tk.Label(left_panel, text="Memory Regions:", font=("Arial", 14), fg="white", bg="#2d2d2d")
+        self.memory_regions_label.pack(pady=5)
+
+        self.memory_regions_listbox = tk.Listbox(left_panel, font=("Consolas", 12), bg="#1e1e1e", fg="white", selectbackground="#007acc", height=25, width=50)
+        self.memory_regions_listbox.pack(fill=tk.BOTH, expand=True)
+
+        self.load_memory_button = tk.Button(left_panel, text="Load Memory Regions", command=self.load_memory_regions, bg="#007acc", fg="white", font=("Arial", 12))
+        self.load_memory_button.pack(pady=5)
+
+        middle_panel = tk.Frame(self.main_frame, bg="#2d2d2d")
+        middle_panel.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        self.search_label = tk.Label(middle_panel, text="Search Memory:", font=("Arial", 14), fg="white", bg="#2d2d2d")
+        self.search_label.pack(pady=5)
+
+        self.data_type_label = tk.Label(middle_panel, text="Data Type:", font=("Arial", 12), fg="white", bg="#2d2d2d")
+        self.data_type_label.pack(pady=5)
+
+        self.data_type_combobox = ttk.Combobox(middle_panel, font=("Arial", 12), values=list(data_types.keys()), state="readonly")
+        self.data_type_combobox.pack(pady=5)
+        self.data_type_combobox.current(0)
+
+        self.search_entry = tk.Entry(middle_panel, font=("Consolas", 12), width=30, bg="#1e1e1e", fg="white")
+        self.search_entry.pack(pady=5)
+
+        self.search_button = tk.Button(middle_panel, text="Search", command=self.search_memory, bg="#007acc", fg="white", font=("Arial", 12))
+        self.search_button.pack(pady=5)
+
+        self.search_results_listbox = tk.Listbox(middle_panel, font=("Consolas", 12), bg="#1e1e1e", fg="white", selectbackground="#007acc", height=15)
+        self.search_results_listbox.pack(fill=tk.BOTH, expand=True, pady=10)
+
+        self.modify_label = tk.Label(middle_panel, text="Modify Value:", font=("Arial", 14), fg="white", bg="#2d2d2d")
+        self.modify_label.pack(pady=5)
+
+        self.modify_entry = tk.Entry(middle_panel, font=("Consolas", 12), width=30, bg="#1e1e1e", fg="white")
+        self.modify_entry.pack(pady=5)
+
+        self.modify_button = tk.Button(middle_panel, text="Modify", command=self.modify_memory, bg="#007acc", fg="white", font=("Arial", 12))
+        self.modify_button.pack(pady=5)
+
+        self.freeze_button = tk.Button(middle_panel, text="Freeze Value", command=self.freeze_value, bg="#007acc", fg="white", font=("Arial", 12))
+        self.freeze_button.pack(pady=10)
+
+        right_panel = tk.Frame(self.main_frame, bg="#2d2d2d")
+        right_panel.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        self.pointer_scan_label = tk.Label(right_panel, text="Pointer Scan:", font=("Arial", 14), fg="white", bg="#2d2d2d")
+        self.pointer_scan_label.pack(pady=5)
+
+        self.pointer_scan_entry = tk.Entry(right_panel, font=("Consolas", 12), width=30, bg="#1e1e1e", fg="white")
+        self.pointer_scan_entry.pack(pady=5)
+
+        self.pointer_scan_button = tk.Button(right_panel, text="Scan", command=self.pointer_scan, bg="#007acc", fg="white", font=("Arial", 12))
+        self.pointer_scan_button.pack(pady=5)
+
+        self.pointer_results_listbox = tk.Listbox(right_panel, font=("Consolas", 12), bg="#1e1e1e", fg="white", selectbackground="#007acc", height=10)
+        self.pointer_results_listbox.pack(fill=tk.BOTH, expand=True, pady=10)
+
+        self.disassembler_label = tk.Label(right_panel, text="Disassembler:", font=("Arial", 14), fg="white", bg="#2d2d2d")
+        self.disassembler_label.pack(pady=5)
+
+        self.disassembler_entry = tk.Entry(right_panel, font=("Consolas", 12), width=30, bg="#1e1e1e", fg="white")
+        self.disassembler_entry.pack(pady=5)
+
+        self.disassembler_button = tk.Button(right_panel, text="Disassemble", command=self.disassemble_memory, bg="#007acc", fg="white", font=("Arial", 12))
+        self.disassembler_button.pack(pady=5)
+
+        self.disassembler_results_listbox = tk.Listbox(right_panel, font=("Consolas", 12), bg="#1e1e1e", fg="white", selectbackground="#007acc", height=10)
+        self.disassembler_results_listbox.pack(fill=tk.BOTH, expand=True, pady=10)
 
     def get_process_list(self):
         process_list = []
         for proc in psutil.process_iter(['pid', 'name']):
-            # Exclude known system processes
-            if proc.info['name'] not in ['System Idle Process', 'System', 'explorer.exe', 'svchost.exe']:
-                process_list.append(f"{proc.info['name']} (PID: {proc.info['pid']})")
+            process_list.append(f"{proc.info['name']} (PID: {proc.info['pid']})")
         return process_list
 
-    def update_process_icon(self, event):
+    def refresh_process_list(self):
+        self.process_combobox['values'] = self.get_process_list()
 
+    def process_selected(self, event):
         selected_process = self.process_combobox.get()
-        pid = int(selected_process.split(" (PID: ")[-1][:-1])
-        icon = get_process_icon(pid)
-        if icon:
-            icon_image = ImageTk.PhotoImage(icon)
-            self.icon_label.config(image=icon_image)
-            self.icon_label.image = icon_image  
-        else:
-            self.icon_label.config(image='')
+        self.selected_pid = int(selected_process.split(" (PID: ")[-1][:-1])
+
+    def attach_process(self):
+        if not self.selected_pid:
+            messagebox.showerror("Error", "No process selected!")
+            return
+        try:
+            self.process_handle = get_process_handle(self.selected_pid)
+            if not self.process_handle:
+                raise Exception("Failed to attach to the process.")
+            messagebox.showinfo("Success", f"Attached to process with PID {self.selected_pid}")
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
 
     def load_memory_regions(self):
-        selected_process = self.process_combobox.get()
-        pid = int(selected_process.split(" (PID: ")[-1][:-1])
-        self.clear_memory_display()
-
-        memory_regions = get_memory_regions(pid)
-        for base_address, region_size in memory_regions:
-            address_label = tk.Label(self.memory_frame, text=f"Base Address: {hex(base_address)} | Size: {region_size}", font=("Arial", 12))
-            address_label.pack(anchor="w")
-
-    def clear_memory_display(self):
-        for widget in self.memory_frame.winfo_children():
-            widget.destroy()
+        if not self.process_handle:
+            messagebox.showerror("Error", "Attach to a process first!")
+            return
+        regions = get_memory_regions(self.selected_pid)
+        self.memory_regions_listbox.delete(0, tk.END)
+        for base, size in regions:
+            self.memory_regions_listbox.insert(tk.END, f"Base: {hex(base)} | Size: {size}")
 
     def search_memory(self):
-        selected_process = self.process_combobox.get()
-        pid = int(selected_process.split(" (PID: ")[-1][:-1])
-        search_value = self.search_entry.get()
-        if not search_value:
-            messagebox.showwarning("Input Error", "Please enter a value to search.")
+        if not self.process_handle:
+            messagebox.showerror("Error", "Attach to a process first!")
             return
-          
-        messagebox.showinfo("Search", f"Searching for value: {search_value} in process PID: {pid}")
+        data_type = data_types[self.data_type_combobox.get()]
+        value = self.search_entry.get()
+        if not value:
+            messagebox.showerror("Error", "Enter a value to search!")
+            return
+        try:
+            search_value = struct.pack(data_type, eval(value))
+            regions = get_memory_regions(self.selected_pid)
+            self.scanned_results.clear()
+            self.search_results_listbox.delete(0, tk.END)
+
+            for base, size in regions:
+                memory = read_memory(self.process_handle, base, size)
+                offset = memory.find(search_value)
+                while offset != -1:
+                    address = base + offset
+                    self.scanned_results.append(address)
+                    self.search_results_listbox.insert(tk.END, f"Address: {hex(address)}")
+                    offset = memory.find(search_value, offset + 1)
+
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
 
     def modify_memory(self):
-        selected_process = self.process_combobox.get()
-        pid = int(selected_process.split(" (PID: ")[-1][:-1])
-        modify_value = self.modify_entry.get()
-        if not modify_value:
-            messagebox.showwarning("Input Error", "Please enter a value to modify.")
+        if not self.process_handle:
+            messagebox.showerror("Error", "Attach to a process first!")
             return
-
-        messagebox.showinfo("Modify", f"Modifying value to: {modify_value} in process PID: {pid}")
+        try:
+            selected_address = self.search_results_listbox.get(tk.ACTIVE)
+            if not selected_address:
+                messagebox.showerror("Error", "No address selected!")
+                return
+            address = int(selected_address.split("Address: ")[-1], 16)
+            new_value = self.modify_entry.get()
+            if not new_value:
+                messagebox.showerror("Error", "Enter a value to modify!")
+                return
+            data_type = data_types[self.data_type_combobox.get()]
+            write_memory(self.process_handle, address, eval(new_value), data_type)
+            messagebox.showinfo("Success", f"Modified address {hex(address)} to {new_value}")
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
 
     def freeze_value(self):
-        selected_process = self.process_combobox.get()
-        pid = int(selected_process.split(" (PID: ")[-1][:-1])
-        freeze_value = self.modify_entry.get()
-        if not freeze_value:
-            messagebox.showwarning("Input Error", "Please enter a value to freeze.")
-            return
+        try:
+            selected_address = self.search_results_listbox.get(tk.ACTIVE)
+            if not selected_address:
+                messagebox.showerror("Error", "No address selected!")
+                return
+            address = int(selected_address.split("Address: ")[-1], 16)
+            value_to_freeze = self.modify_entry.get()
+            if not value_to_freeze:
+                messagebox.showerror("Error", "Enter a value to freeze!")
+                return
+            data_type = data_types[self.data_type_combobox.get()]
+            self.frozen_values[address] = (eval(value_to_freeze), data_type)
+            threading.Thread(target=self.freeze_loop, daemon=True).start()
+            messagebox.showinfo("Success", f"Value at address {hex(address)} is now frozen.")
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
 
-        self.frozen_values[pid] = freeze_value
-        messagebox.showinfo("Freeze", f"Value {freeze_value} is now frozen in process PID: {pid}")
+    def freeze_loop(self):
+        while self.frozen_values:
+            for address, (value, data_type) in self.frozen_values.items():
+                try:
+                    write_memory(self.process_handle, address, value, data_type)
+                except Exception:
+                    pass
+            time.sleep(0.1)
 
-    def get_ce_version(self):
-        # Placeholder for actual version retrieval logic
-        messagebox.showinfo("Version", "Memory Manager Version: 1.0.1")
+    def pointer_scan(self):
+        messagebox.showinfo("Info", "Pointer scan functionality is under construction.")
+
+    def disassemble_memory(self):
+        messagebox.showinfo("Info", "Disassembler functionality is under construction.")
 
 if __name__ == "__main__":
     root = tk.Tk()
